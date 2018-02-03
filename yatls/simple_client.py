@@ -160,9 +160,8 @@ class SimpleClient(object):
         data = b""
         offset = 0
         records = []
-        initial_cipher_spec_changed = self._cipher_spec_changed
-        initial_server_seq_num = self._server_seq_num
 
+        # Receive some initial data
         while True:
             recv = self._sock.recv(1024)
             data += recv
@@ -170,73 +169,73 @@ class SimpleClient(object):
             if not len(recv) == 1024:
                 break
 
-        # Nasty hack to try receiving more data if decoding fails
-        while True:
-            try:
-                while offset < len(data):
-                    if not self._cipher_spec_changed:
-                        size, record = TLSPlaintext().decode(data, offset)
-                        offset += size
-
+        while offset < len(data):
+            # Receive data until all the records can be decoded
+            while True:
+                try:
+                    if self._cipher_spec_changed:
+                        size, raw_record = TLSCiphertext().decode(data, offset)
                     else:
-                        size, encrypted_record = TLSCiphertext().decode(data, offset)
-                        offset += size
+                        size, raw_record = TLSPlaintext().decode(data, offset)
 
-                        iv = encrypted_record["fragment"][0:16]
-                        ciphertext = encrypted_record["fragment"][16:]
+                    offset += size
+                    break
+                except IndexError:
+                    data += self._sock.recv(1024)
 
-                        # Initialize the decryption
-                        decrypt_state = pyaes.AESModeOfOperationCBC(self._server_write_key, iv)
+            # If encryption was negotiated, decrypt the record first
+            if self._cipher_spec_changed:
+                iv = raw_record["fragment"][0:16]
+                ciphertext = raw_record["fragment"][16:]
 
-                        plaintext = b""
-                        for i in range(0, len(ciphertext), 16):
-                            block = ciphertext[i: i+16]
-                            plaintext += decrypt_state.decrypt(block)
+                # Initialize the decryption
+                decrypt_state = pyaes.AESModeOfOperationCBC(self._server_write_key, iv)
 
-                        # Remove the plaintext padding
-                        padding_length = plaintext[-1]
-                        plaintext = plaintext[:-padding_length-1]
+                plaintext = b""
+                for i in range(0, len(ciphertext), 16):
+                    block = ciphertext[i: i+16]
+                    plaintext += decrypt_state.decrypt(block)
 
-                        fragment = plaintext[:-20]
-                        mac = plaintext[-20:]
+                # Remove the plaintext padding
+                padding_length = plaintext[-1]
+                plaintext = plaintext[:-padding_length-1]
 
-                        record = {
-                            "type": encrypted_record["type"],
-                            "version": encrypted_record["version"],
-                            "fragment": fragment
-                        }
+                fragment = plaintext[:-20]
+                mac = plaintext[-20:]
 
-                        raw_record = TLSPlaintext().encode(record)
-                        mac_verify = hmac.HMAC(self._server_write_MAC_key,
-                                               self._server_seq_num.to_bytes(8, "big") + raw_record,
-                                               hashlib.sha1).digest()
+                record = {
+                    "type": raw_record["type"],
+                    "version": raw_record["version"],
+                    "fragment": fragment
+                }
 
-                        if not mac == mac_verify:
-                            raise IOError("Invalid MAC")
+                raw_record = TLSPlaintext().encode(record)
+                mac_verify = hmac.HMAC(self._server_write_MAC_key,
+                                       self._server_seq_num.to_bytes(8, "big") + raw_record,
+                                       hashlib.sha1).digest()
 
-                        self._server_seq_num += 1
+                if not mac == mac_verify:
+                    raise IOError("Invalid MAC")
 
-                    if record["type"] == "alert":
-                        alert = Alert().decode(record["fragment"])[1]
+                self._server_seq_num += 1
+            else:
+                record = raw_record
 
-                        if alert["level"] == "fatal":
-                            raise IOError("TLS Alert {}".format(alert))
-                        else:
-                            print("TLS Alert Warning {}".format(alert))
+            if record["type"] == "alert":
+                alert = Alert().decode(record["fragment"])[1]
 
-                    elif record["type"] == "change_cipher_spec":
-                        self._cipher_spec_changed = True
+                if alert["level"] == "fatal":
+                    raise IOError("TLS Alert {}".format(alert))
+                else:
+                    print("TLS Alert Warning {}".format(alert))
 
-                    else:
-                        records.append(record)
+            elif record["type"] == "change_cipher_spec":
+                self._cipher_spec_changed = True
 
-                return records
-            except IndexError:
-                records = []
-                offset = 0
-                self._cipher_spec_changed = initial_cipher_spec_changed
-                self._server_seq_num = initial_server_seq_num
-                data += self._sock.recv(1024)
+            else:
+                records.append(record)
+
+        return records
 
     def _send_handshake(self, handshake_type, body, encrypted=False):
         data = Handshake().encode(
